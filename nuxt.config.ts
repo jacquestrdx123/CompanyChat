@@ -6,7 +6,7 @@ export default defineNuxtConfig({
   // Internal tool behind a login: no SEO needs, so run as an SPA.
   ssr: false,
 
-  modules: ['@nuxt/ui', '@nuxtjs/supabase', '@pinia/nuxt'],
+  modules: ['@nuxt/ui', '@pinia/nuxt'],
 
   css: ['~/assets/css/main.css'],
 
@@ -28,18 +28,15 @@ export default defineNuxtConfig({
 
   runtimeConfig: {
     public: {
+      // The Laravel API (backend/). Set NUXT_PUBLIC_API_URL at build time.
+      apiUrl: 'http://localhost:8000',
+      // Reverb websockets. Set NUXT_PUBLIC_REVERB_KEY / _HOST / _PORT / _SCHEME to match the backend's REVERB_* values.
+      reverbKey: '',
+      reverbHost: 'localhost',
+      reverbPort: 8080,
+      reverbScheme: 'http',
       // Public Web Push (VAPID) key; set NUXT_PUBLIC_VAPID_PUBLIC_KEY at build time. Empty hides background notifications.
       vapidPublicKey: '',
-    },
-  },
-
-  supabase: {
-    redirectOptions: {
-      login: '/login',
-      callback: '/confirm',
-      // Static hosting (Forge) redirects /confirm to /confirm/. The module matches paths exactly, so without
-      // the trailing-slash forms the invite/reset landing page counts as protected and bounces to login.
-      exclude: ['/confirm/', '/login/'],
     },
   },
 })

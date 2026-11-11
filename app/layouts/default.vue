@@ -1,10 +1,9 @@
 <script setup lang="ts">
 import { STATUS_OPTIONS, effectiveStatus } from '~/utils/status'
 
-const supabase = useSupabaseClient()
+const auth = useAuth()
 const store = useProfileStore()
 const chat = useChatStore()
-const user = useSupabaseUser()
 const toast = useToast()
 const notifier = useNotifier()
 const installer = useInstallPrompt()
@@ -23,20 +22,18 @@ useHead({
 })
 
 watch(
-  user,
-  (u) => {
-    if (!u) return
-    store.load().catch(async (e) => {
-      // No profile row visible (PGRST116) means the account was deactivated: end the session.
-      if (e?.code === 'PGRST116') {
-        await supabase.auth.signOut()
-        chat.reset()
-        await navigateTo('/login')
-      }
-    })
+  auth.token,
+  async (token) => {
+    if (!token) return
+    try {
+      await store.load() // also tells us who we are; a revoked token or deactivated account ends the session here
+    } catch (e) {
+      if (auth.signedIn.value) toast.add({ title: 'Could not load your profile', description: errorMessage(e), color: 'error' })
+      return
+    }
     chat.start()
     push.sync()
-    chat.load().catch((e) => toast.add({ title: 'Could not load chats', description: String(e?.message ?? e), color: 'error' }))
+    chat.load().catch((e) => toast.add({ title: 'Could not load chats', description: errorMessage(e), color: 'error' }))
   },
   { immediate: true },
 )
@@ -75,6 +72,18 @@ function notificationState() {
   return onOff(notifier.active.value)
 }
 
+// Desktop app only: start CompanyChat (hidden in the tray) when you sign in to the computer.
+const desktop = desktopBridge()
+const launchAtLogin = ref<{ supported: boolean; on: boolean } | null>(null)
+onMounted(async () => {
+  launchAtLogin.value = (await desktop?.getLaunchAtLogin?.().catch(() => null)) ?? null
+})
+async function toggleLaunchAtLogin() {
+  if (!desktop?.setLaunchAtLogin || !launchAtLogin.value) return
+  const on = await desktop.setLaunchAtLogin(!launchAtLogin.value.on)
+  launchAtLogin.value = { ...launchAtLogin.value, on }
+}
+
 async function sendTest() {
   if (notifier.permission.value !== 'granted') {
     toast.add({
@@ -111,6 +120,9 @@ const items = computed(() => [
         { label: `Message previews: ${onOff(notifier.prefs.value.preview)}`, icon: 'i-lucide-eye', onSelect: togglePreview },
       ]]
     : []),
+  ...(launchAtLogin.value?.supported
+    ? [[{ label: `Start at login: ${onOff(launchAtLogin.value.on)}`, icon: 'i-lucide-power', onSelect: toggleLaunchAtLogin }]]
+    : []),
   ...(installer.canInstall.value ? [[{ label: 'Install app', icon: 'i-lucide-download', onSelect: installer.install }]] : []),
   ...(store.isAdmin ? [[{ label: 'Manage users', icon: 'i-lucide-shield', to: '/admin/users' }]] : []),
   [{
@@ -118,9 +130,9 @@ const items = computed(() => [
     icon: 'i-lucide-log-out',
     onSelect: async () => {
       await push.forget().catch(() => {}) // before signing out, while we can still authenticate
-      await supabase.auth.signOut()
-      store.profile = null
       chat.reset()
+      await auth.signOut()
+      store.profile = null
       await navigateTo('/login')
     },
   }],

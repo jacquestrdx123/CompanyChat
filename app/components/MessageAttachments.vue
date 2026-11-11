@@ -13,7 +13,7 @@ const emit = defineEmits<{ delete: [attachment: AttachmentView] }>()
 const { urls, ensure } = useAttachmentUrls()
 
 const live = computed(() => props.attachments.filter((a) => !a.deleted_at))
-watch(() => live.value.map((a) => a.path).join('|'), () => ensure(live.value), { immediate: true })
+watch(() => live.value.map((a) => a.id).join('|'), () => { void ensure(live.value).catch(() => {}) }, { immediate: true })
 </script>
 
 <template>
@@ -23,13 +23,13 @@ watch(() => live.value.map((a) => a.path).join('|'), () => ensure(live.value), {
         <UIcon name="i-lucide-trash-2" class="size-3" /> Attachment deleted
       </span>
       <div v-else class="group/attachment relative">
-        <a v-if="isInlineImage(a.mime_type)" :href="urls[a.path]" target="_blank" rel="noopener" class="block">
-          <img v-if="urls[a.path]" :src="urls[a.path]" :alt="a.file_name" class="max-h-64 max-w-full rounded border border-default" />
+        <a v-if="isInlineImage(a.mime_type)" :href="urls[a.id]" target="_blank" rel="noopener" class="block">
+          <img v-if="urls[a.id]" :src="urls[a.id]" :alt="a.file_name" class="max-h-64 max-w-full rounded border border-default" />
           <span v-else class="text-sm text-muted">{{ a.file_name }}…</span>
         </a>
         <a
           v-else
-          :href="urls[a.path]"
+          :href="urls[a.id]"
           class="flex items-center gap-2 rounded border border-default px-3 py-2 text-sm hover:bg-elevated"
         >
           <UIcon name="i-lucide-file" class="size-4" />

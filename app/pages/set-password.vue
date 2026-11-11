@@ -1,7 +1,9 @@
 <script setup lang="ts">
+import { errorMessage as errorText } from '~/utils/errors'
+
 definePageMeta({ layout: 'blank' })
 
-const supabase = useSupabaseClient()
+const api = useApi()
 const password = ref('')
 const confirm = ref('')
 const loading = ref(false)
@@ -12,10 +14,14 @@ async function save() {
   if (password.value.length < 8) return void (errorMessage.value = 'Use at least 8 characters.')
   if (password.value !== confirm.value) return void (errorMessage.value = 'The passwords do not match.')
   loading.value = true
-  const { error } = await supabase.auth.updateUser({ password: password.value })
-  loading.value = false
-  if (error) errorMessage.value = error.message
-  else await navigateTo('/')
+  try {
+    await api('/me/password', { method: 'PUT', body: { password: password.value } })
+    await navigateTo('/')
+  } catch (e) {
+    errorMessage.value = errorText(e)
+  } finally {
+    loading.value = false
+  }
 }
 </script>
 

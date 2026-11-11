@@ -1,25 +1,24 @@
 <script setup lang="ts">
 definePageMeta({ layout: 'blank' })
 
-const supabase = useSupabaseClient()
-const user = useSupabaseUser()
+const auth = useAuth()
 
 const email = ref('')
 const password = ref('')
 const loading = ref(false)
-const errorMessage = ref('')
-
-watch(user, (u) => { if (u) navigateTo('/') }, { immediate: true })
+const failed = ref('')
 
 async function signIn() {
   loading.value = true
-  errorMessage.value = ''
-  const { error } = await supabase.auth.signInWithPassword({
-    email: email.value,
-    password: password.value,
-  })
-  loading.value = false
-  if (error) errorMessage.value = error.message
+  failed.value = ''
+  try {
+    await auth.signIn(email.value, password.value)
+    await navigateTo('/')
+  } catch (e) {
+    failed.value = errorMessage(e)
+  } finally {
+    loading.value = false
+  }
 }
 </script>
 
@@ -36,10 +35,13 @@ async function signIn() {
         <UFormField label="Password">
           <UInput v-model="password" type="password" autocomplete="current-password" required class="w-full" />
         </UFormField>
-        <UAlert v-if="errorMessage" color="error" variant="subtle" :description="errorMessage" />
+        <UAlert v-if="failed" color="error" variant="subtle" :description="failed" />
         <UButton type="submit" block :loading="loading">Sign in</UButton>
       </form>
-      <p class="mt-4 text-sm text-muted">Accounts are invite-only. Ask an admin for access.</p>
+      <p class="mt-4 text-sm text-muted">
+        Accounts are invite-only. Ask an admin for access.
+        <NuxtLink to="/forgot-password" class="text-primary hover:underline">Forgot your password?</NuxtLink>
+      </p>
     </UCard>
   </div>
 </template>

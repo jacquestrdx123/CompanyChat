@@ -1,16 +1,9 @@
 <script setup lang="ts">
-import type { Database } from '~/types/database.types'
+import type { AdminUser, AppRole } from '~/types/api'
 
-type AppRole = Database['public']['Enums']['app_role']
-interface UserRow {
-  id: string
-  email: string
-  display_name: string
-  app_role: AppRole
-  is_active: boolean
-}
+type UserRow = AdminUser
 
-const supabase = useSupabaseClient<Database>()
+const api = useApi()
 const store = useProfileStore()
 const chat = useChatStore()
 const toast = useToast()
@@ -19,75 +12,63 @@ const users = ref<UserRow[]>([])
 const loading = ref(true)
 
 const isSuperAdmin = computed(() => store.isSuperAdmin)
+
 const ROLE_LABELS: Record<AppRole, string> = { super_admin: 'Super admin', admin: 'Admin', member: 'Member', viewer: 'Viewer' }
+
 // Super admin: admin/member/viewer for anyone. Admins: member/viewer for members and viewers.
 const roleItems = computed(() => (isSuperAdmin.value ? ['admin', 'member', 'viewer'] : ['member', 'viewer']).map((r) => ({ label: ROLE_LABELS[r as AppRole], value: r })))
+
 function canChangeRole(u: UserRow) {
   if (!u.is_active || u.id === store.profile?.id || u.app_role === 'super_admin') return false
   return isSuperAdmin.value || u.app_role === 'member' || u.app_role === 'viewer'
 }
 
+// People who have not accepted their invite yet.
+const pending = computed(() => users.value.filter((u) => u.pending).map((u) => u.id))
+
 async function load() {
-  const { data, error } = await supabase
-    .from('profiles')
-    .select('id, email, display_name, app_role, is_active')
-    .order('display_name')
-  loading.value = false
-  if (error) {
+  try {
+    users.value = await api<UserRow[]>('/admin/users')
+  } catch (error) {
     toast.add({ title: 'Could not load users', description: errorMessage(error), color: 'error' })
-    return
+  } finally {
+    loading.value = false
   }
-  users.value = data
+}
+
+/** Run an admin action; returns the API's own error message, or null when it worked. */
+async function callAdmin(path: string, options: { method?: 'POST' | 'PUT'; body?: Record<string, unknown> } = {}): Promise<string | null> {
+  try {
+    await api(`/admin/users${path}`, { method: options.method ?? 'POST', body: options.body })
+    return null
+  } catch (e) {
+    return errorMessage(e)
+  }
 }
 
 async function changeRole(user: UserRow, role: AppRole) {
-  const { error } = await supabase.rpc('set_app_role', { target: user.id, new_role: role })
-  if (error) toast.add({ title: 'Could not change role', description: errorMessage(error), color: 'error' })
+  const problem = await callAdmin(`/${user.id}/role`, { method: 'PUT', body: { role } })
+  if (problem) toast.add({ title: 'Could not change role', description: problem, color: 'error' })
   await load()
   await chat.load()
-}
-
-/** Call the admin-users Edge Function; surfaces the function's own error message. */
-async function callAdmin(body: Record<string, unknown>): Promise<string | null> {
-  return (await callAdminData(body)).problem
-}
-
-async function callAdminData<T = unknown>(body: Record<string, unknown>): Promise<{ problem: string | null; data: T | null }> {
-  const { data, error } = await supabase.functions.invoke('admin-users', { body })
-  if (!error) return { problem: null, data: data as T }
-  const context = (error as { context?: Response }).context
-  if (context && typeof context.json === 'function') {
-    try {
-      const payload = await context.json()
-      if (payload?.error) return { problem: String(payload.error), data: null }
-    } catch { /* fall through */ }
-  }
-  return { problem: errorMessage(error), data: null }
 }
 
 async function sendPasswordReset(user: UserRow) {
   if (!confirm(`Email ${user.display_name} a link to choose a new password?`)) return
   busyId.value = user.id
-  const problem = await callAdmin({ action: 'send_password_reset', user_id: user.id })
+  const problem = await callAdmin(`/${user.id}/password-reset`)
   busyId.value = null
   if (problem) toast.add({ title: 'Could not send the password email', description: problem, color: 'error' })
   else toast.add({ title: 'Password email sent', description: `${user.email} will get a link to choose a new password.` })
 }
 
-// People who have not accepted their invite yet.
-const pending = ref<string[]>([])
-async function loadPending() {
-  const { data } = await callAdminData<{ pending: string[] }>({ action: 'pending' })
-  pending.value = data?.pending ?? []
-}
-
 async function resendInvite(user: UserRow) {
   busyId.value = user.id
-  const problem = await callAdmin({ action: 'resend_invite', user_id: user.id })
+  const problem = await callAdmin(`/${user.id}/resend-invite`)
   busyId.value = null
   if (problem) toast.add({ title: 'Could not resend the invite', description: problem, color: 'error' })
   else toast.add({ title: 'Invite resent', description: `A new email is on its way to ${user.email}.` })
-  await loadPending()
+  await load()
 }
 
 const inviteEmail = ref('')
@@ -96,7 +77,7 @@ const inviting = ref(false)
 
 async function invite() {
   inviting.value = true
-  const problem = await callAdmin({ action: 'invite', email: inviteEmail.value, display_name: inviteName.value })
+  const problem = await callAdmin('', { body: { email: inviteEmail.value, display_name: inviteName.value } })
   inviting.value = false
   if (problem) {
     toast.add({ title: 'Could not send invite', description: problem, color: 'error' })
@@ -106,7 +87,7 @@ async function invite() {
   inviteEmail.value = ''
   inviteName.value = ''
   await load()
-  await loadPending()
+  await chat.load()
 }
 
 const busyId = ref<string | null>(null)
@@ -114,20 +95,20 @@ const busyId = ref<string | null>(null)
 async function setActive(user: UserRow, active: boolean) {
   if (!active && !confirm(`Deactivate ${user.display_name}? They will be signed out and unable to sign in until reactivated. Their messages stay.`)) return
   busyId.value = user.id
-  const problem = await callAdmin({ action: active ? 'reactivate' : 'deactivate', user_id: user.id })
+  const problem = await callAdmin(`/${user.id}/${active ? 'reactivate' : 'deactivate'}`)
   busyId.value = null
   if (problem) toast.add({ title: active ? 'Could not reactivate' : 'Could not deactivate', description: problem, color: 'error' })
   await load()
   await chat.load()
 }
 
-// Same rules as the Edge Function; the function is what actually enforces them.
+// Same rules as the API; the API is what actually enforces them.
 function canToggle(u: UserRow) {
   if (u.id === store.profile?.id || u.app_role === 'super_admin') return false
   return u.app_role === 'member' || u.app_role === 'viewer' || isSuperAdmin.value
 }
 
-watch(() => store.profile?.id, (id) => { if (id) { load(); loadPending() } }, { immediate: true })
+watch(() => store.profile?.id, (id) => { if (id && store.isAdmin) load() }, { immediate: true })
 </script>
 
 <template>

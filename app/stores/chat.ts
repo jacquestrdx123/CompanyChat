@@ -1,11 +1,16 @@
 import { defineStore } from 'pinia'
-import type { Database } from '~/types/database.types'
+import type { ApiChannel, ApiClient, ApiMessage, ApiUser } from '~/types/api'
 import { effectiveStatus, type DisplayStatus } from '~/utils/status'
 
-type Tables = Database['public']['Tables']
-export type Client = Pick<Tables['clients']['Row'], 'id' | 'name'>
+export type Client = Pick<ApiClient, 'id' | 'name'>
 export interface ArchivedProject { id: string; name: string | null; client_id: string; clientName: string }
-export type DirectoryUser = Pick<Tables['profiles']['Row'], 'id' | 'display_name' | 'status' | 'app_role' | 'is_active'>
+export type DirectoryUser = Pick<ApiUser, 'id' | 'display_name' | 'status' | 'app_role' | 'is_active'>
+
+/** Live events of one channel (Reverb private-channel.{id}), passed on to whoever shows that channel. */
+export type ChannelEvent =
+  | { type: 'created'; message: ApiMessage }
+  | { type: 'updated'; message: ApiMessage }
+  | { type: 'deleted'; id: string; channel_id: string }
 export interface Channel {
   id: string
   kind: 'project' | 'dm'
@@ -16,8 +21,8 @@ export interface Channel {
 }
 
 export const useChatStore = defineStore('chat', () => {
-  const supabase = useSupabaseClient<Database>()
-  const me = useSupabaseUser()
+  const api = useApi()
+  const auth = useAuth()
 
   const clients = ref<Client[]>([])
   const channels = ref<Channel[]>([])
@@ -32,7 +37,7 @@ export const useChatStore = defineStore('chat', () => {
   const watchedChannelIds = ref<string[]>([])
   const loaded = ref(false)
 
-  const myId = computed(() => me.value?.id ?? me.value?.sub ?? null)
+  const myId = computed(() => auth.user.value?.id ?? null)
 
   const projectsByClient = computed(() => {
     const map: Record<string, Channel[]> = {}
@@ -67,40 +72,37 @@ export const useChatStore = defineStore('chat', () => {
   const notifier = useNotifier()
   const push = usePush()
 
-  // UI hints only: RLS is what actually enforces these.
+  // UI hints only: the API is what actually enforces these.
   const canManageClient = (_clientId?: string) => profileStore.isAdmin
   const canManageChannel = (channel: Channel | undefined) => !!channel && channel.kind === 'project' && profileStore.isAdmin
 
   async function load() {
     const [c, ch, p, watches] = await Promise.all([
-      supabase.from('clients').select('id, name, archived_at').order('name'),
-      supabase.from('channels').select('id, kind, client_id, name, is_private, archived_at, channel_members(user_id)'),
-      supabase.from('profiles').select('id, display_name, status, app_role, is_active').order('display_name'),
-      supabase.from('channel_watches').select('channel_id'),
+      api<ApiClient[]>('/clients'),
+      api<ApiChannel[]>('/channels'),
+      api<ApiUser[]>('/users'),
+      api<string[]>('/watches'),
     ])
-    if (c.error) throw c.error
-    if (ch.error) throw ch.error
-    if (p.error) throw p.error
-    if (watches.error) throw watches.error
-    const archivedClientIds = new Set(c.data.filter((x) => x.archived_at).map((x) => x.id))
-    clients.value = c.data.filter((x) => !x.archived_at).map(({ id, name }) => ({ id, name }))
-    archivedClients.value = c.data.filter((x) => x.archived_at).map(({ id, name }) => ({ id, name }))
-    const clientNames = Object.fromEntries(c.data.map((x) => [x.id, x.name]))
+    const archivedClientIds = new Set(c.filter((x) => x.archived_at).map((x) => x.id))
+    clients.value = c.filter((x) => !x.archived_at).map(({ id, name }) => ({ id, name }))
+    archivedClients.value = c.filter((x) => x.archived_at).map(({ id, name }) => ({ id, name }))
+    const clientNames = Object.fromEntries(c.map((x) => [x.id, x.name]))
     // A project is archived on its own, or because its client is (the latter is restored with the client).
-    archivedProjects.value = ch.data
+    archivedProjects.value = ch
       .filter((row) => row.kind === 'project' && row.archived_at && row.client_id && !archivedClientIds.has(row.client_id))
       .map((row) => ({ id: row.id, name: row.name, client_id: row.client_id!, clientName: clientNames[row.client_id!] ?? '' }))
-    channels.value = ch.data.filter((row) => !row.archived_at && !(row.client_id && archivedClientIds.has(row.client_id))).map((row) => ({
+    channels.value = ch.filter((row) => !row.archived_at && !(row.client_id && archivedClientIds.has(row.client_id))).map((row) => ({
       id: row.id,
       kind: row.kind,
       client_id: row.client_id,
       name: row.name,
       is_private: row.is_private,
-      member_ids: row.channel_members.map((m) => m.user_id),
+      member_ids: row.member_ids,
     }))
-    watchedChannelIds.value = watches.data.map((w) => w.channel_id)
-    directory.value = Object.fromEntries(p.data.map((u) => [u.id, u]))
+    watchedChannelIds.value = watches
+    directory.value = Object.fromEntries(p.map((u) => [u.id, { id: u.id, display_name: u.display_name, status: u.status, app_role: u.app_role, is_active: u.is_active }]))
     loaded.value = true
+    syncChannelSubscriptions()
     await loadUnread()
   }
 
@@ -112,24 +114,30 @@ export const useChatStore = defineStore('chat', () => {
   // --- unread counts ---------------------------------------------------------------------
   const viewing = () => typeof document !== 'undefined' && document.hasFocus()
 
-  async function loadUnread() {
-    const { data, error } = await supabase.rpc('get_unread_counts')
-    if (error) return // counts are a nicety; never block the app on them
-    const counts = Object.fromEntries(data.map((r) => [r.chan_id, Number(r.unread)]))
-    if (activeChannelId.value && viewing()) delete counts[activeChannelId.value]
+  /** False when the counts could not be fetched (e.g. still offline). */
+  async function loadUnread(): Promise<boolean> {
+    let data: { unread: Record<string, number>; mentions: Record<string, number> }
+    try {
+      data = await api('/unread')
+    } catch {
+      return false // counts are a nicety; never block the app on them
+    }
+    // PHP sends an empty object as [] when nothing is unread
+    const counts = { ...(Array.isArray(data.unread) ? {} : data.unread) }
+    const mentionCounts = { ...(Array.isArray(data.mentions) ? {} : data.mentions) }
+    if (activeChannelId.value && viewing()) {
+      delete counts[activeChannelId.value]
+      delete mentionCounts[activeChannelId.value]
+    }
     unread.value = counts
-
-    const { data: mentionData, error: mentionError } = await supabase.rpc('get_unread_mention_counts')
-    if (mentionError) return
-    const mentionCounts = Object.fromEntries(mentionData.map((r) => [r.chan_id, Number(r.mentions)]))
-    if (activeChannelId.value && viewing()) delete mentionCounts[activeChannelId.value]
     mentions.value = mentionCounts
+    return true
   }
 
   async function markRead(channelId: string) {
     if (unread.value[channelId]) unread.value = { ...unread.value, [channelId]: 0 }
     if (mentions.value[channelId]) mentions.value = { ...mentions.value, [channelId]: 0 }
-    await supabase.rpc('mark_channel_read', { chid: channelId })
+    await api(`/channels/${channelId}/read`, { method: 'POST' }).catch(() => {})
   }
 
   function setActive(channelId: string | null) {
@@ -166,7 +174,8 @@ export const useChatStore = defineStore('chat', () => {
     if (!decision.notify) return
     if (push.active.value) {
       // The service worker shows the notification (also when this tab is open but not focused); don't double up.
-      notifier.chime()
+      // It plays the system sound itself unless a CompanyChat window is visible, so only chime when we are.
+      if (document.visibilityState === 'visible') notifier.chime()
       return
     }
     const text = notificationText({
@@ -181,84 +190,139 @@ export const useChatStore = defineStore('chat', () => {
     })
   }
 
-  async function setWatching(channelId: string, on: boolean) {
-    if (on) {
-      const { error } = await supabase.from('channel_watches').insert({ channel_id: channelId })
-      if (error) throw error
-      watchedChannelIds.value = [...watchedChannelIds.value, channelId]
-    } else {
-      const { error } = await supabase.from('channel_watches').delete().eq('channel_id', channelId)
-      if (error) throw error
-      watchedChannelIds.value = watchedChannelIds.value.filter((id) => id !== channelId)
-    }
+  // --- catching up after sleep or a dropped connection -------------------------------------
+  // Live events sent while the socket was down are gone. When it comes back, reload the unread counts and tell
+  // the person in one notification what arrived meanwhile (unless push already did, or they are looking).
+  let catchingUp: Promise<void> | null = null
+  let lastCatchUp = 0
+
+  function catchUp(reason: string) {
+    if (!loaded.value || catchingUp || Date.now() - lastCatchUp < 5000) return
+    lastCatchUp = Date.now()
+    catchingUp = (async () => {
+      const before = { unread: { ...unread.value }, mentions: { ...mentions.value } }
+      if (!(await loadUnread())) {
+        lastCatchUp = 0 // network not back yet: let the reconnect try again
+        return
+      }
+      const summary = catchUpSummary({
+        before,
+        after: { unread: unread.value, mentions: mentions.value },
+        channels: channels.value,
+        watched: watchedChannelIds.value,
+        windowFocused: viewing(),
+        status: profileStore.profile?.status,
+      })
+      console.debug('[notify] catch-up after', reason, summary ? `- ${summary.count} missed` : '- nothing missed')
+      if (!summary || push.active.value) return // with push on, the service worker already showed them
+      const first = summary.channelIds[0]!
+      const problem = await notifier.show({ channelId: 'catch-up', url: `/c/${first}`, forcePreview: true, ...catchUpText(summary) })
+      if (problem) console.debug('[notify] catch-up not shown:', problem)
+    })().finally(() => { catchingUp = null })
   }
 
-  // --- live presence and profile updates -------------------------------------------------
+  async function setWatching(channelId: string, on: boolean) {
+    await api(`/channels/${channelId}/watch`, { method: on ? 'PUT' : 'DELETE' })
+    watchedChannelIds.value = on ? [...watchedChannelIds.value, channelId] : watchedChannelIds.value.filter((id) => id !== channelId)
+  }
+
+  // --- live updates over Reverb --------------------------------------------------------
+  //   presence-office          who is online, profile changes, "directory changed" (refetch)
+  //   private-channel.{id}     messages in every channel we can open (unread badges, notifications, open page)
+  //   private-user.{me}        our own @mentions
   let started: string | null = null
-  let presenceChannel: ReturnType<typeof supabase.channel> | null = null
-  let profileChannel: ReturnType<typeof supabase.channel> | null = null
-  let messageChannel: ReturnType<typeof supabase.channel> | null = null
-  let mentionChannel: ReturnType<typeof supabase.channel> | null = null
+  let subscribed = new Set<string>()
+  let stopConnected: (() => void) | null = null
+  let stopResume: (() => void) | null = null
+  const channelListeners = new Set<(e: ChannelEvent) => void>()
   const onFocus = () => { if (activeChannelId.value) markRead(activeChannelId.value) }
 
-  /** Idempotent per signed-in user (the auth user object can re-emit on token refresh). */
+  /** Hear the live events of channels (used by the open channel page). Returns an unsubscribe function. */
+  function onChannelEvent(fn: (e: ChannelEvent) => void): () => void {
+    channelListeners.add(fn)
+    return () => channelListeners.delete(fn)
+  }
+
+  function emit(e: ChannelEvent) {
+    for (const fn of channelListeners) fn(e)
+  }
+
+  /** Follow exactly the channels we can open: join new ones, leave ones we lost. */
+  function syncChannelSubscriptions() {
+    if (!started) return
+    const echo = useEcho()
+    const wanted = new Set(channels.value.map((c) => c.id))
+    for (const id of subscribed) {
+      if (!wanted.has(id)) echo.leave(`channel.${id}`)
+    }
+    for (const id of wanted) {
+      if (subscribed.has(id)) continue
+      echo.private(`channel.${id}`)
+        .listen('.message.created', (e: { message: ApiMessage }) => {
+          emit({ type: 'created', message: e.message })
+          onIncomingMessage(e.message)
+        })
+        .listen('.message.updated', (e: { message: ApiMessage }) => emit({ type: 'updated', message: e.message }))
+        .listen('.message.deleted', (e: { id: string; channel_id: string }) => emit({ type: 'deleted', ...e }))
+    }
+    subscribed = wanted
+  }
+
+  /** Idempotent per signed-in user. */
   function start() {
     const id = myId.value
     if (!id || started === id) return
     stop()
     started = id
+    const echo = useEcho()
 
-    presenceChannel = supabase.channel('office-presence', { config: { presence: { key: id } } })
-    presenceChannel
-      .on('presence', { event: 'sync' }, () => {
-        onlineIds.value = Object.keys(presenceChannel?.presenceState() ?? {})
-      })
-      .subscribe(async (status) => {
-        if (status === 'SUBSCRIBED') await presenceChannel?.track({ online_at: new Date().toISOString() })
-      })
-
-    profileChannel = supabase
-      .channel('profiles-live')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, (payload) => {
-        const row = payload.new as Partial<DirectoryUser> & { id?: string }
-        if (row?.id && row.display_name !== undefined) {
-          directory.value = {
-            ...directory.value,
-            [row.id]: { id: row.id, display_name: row.display_name, status: row.status!, app_role: row.app_role!, is_active: row.is_active ?? true },
-          }
+    echo.join('office')
+      .here((members: { id: string }[]) => { onlineIds.value = members.map((m) => m.id) })
+      .joining((m: { id: string }) => { if (!onlineIds.value.includes(m.id)) onlineIds.value = [...onlineIds.value, m.id] })
+      .leaving((m: { id: string }) => { onlineIds.value = onlineIds.value.filter((x) => x !== m.id) })
+      .listen('.profile.updated', (e: { user: ApiUser }) => {
+        const u = e.user
+        directory.value = { ...directory.value, [u.id]: { id: u.id, display_name: u.display_name, status: u.status, app_role: u.app_role, is_active: u.is_active } }
+        if (u.id === myId.value) {
+          if (!u.is_active) return // the next API call ends the session
+          const profileStore = useProfileStore()
+          if (profileStore.profile) profileStore.profile = { ...profileStore.profile, ...u, email: profileStore.profile.email }
         }
       })
-      .subscribe()
+      .listen('.directory.changed', () => { void load().catch(() => {}) })
 
-    // RLS filters these events, so we only hear about channels we can access.
-    messageChannel = supabase
-      .channel('messages-all')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
-        onIncomingMessage(payload.new as { channel_id: string; user_id: string | null; body?: string })
-      })
-      .subscribe()
+    // Only our own mentions are sent to this channel.
+    echo.private(`user.${id}`).listen('.mention.created', (e: { channel_id: string }) => {
+      if (e.channel_id === activeChannelId.value && viewing()) return // already being read
+      mentions.value = { ...mentions.value, [e.channel_id]: (mentions.value[e.channel_id] ?? 0) + 1 }
+    })
 
-    // Only our own mentions are delivered (RLS), so no filter is needed beyond being explicit.
-    mentionChannel = supabase
-      .channel('mentions-me')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'message_mentions', filter: `user_id=eq.${id}` }, (payload) => {
-        const channelId = (payload.new as { channel_id: string }).channel_id
-        if (channelId === activeChannelId.value && viewing()) return // already being read
-        mentions.value = { ...mentions.value, [channelId]: (mentions.value[channelId] ?? 0) + 1 }
-      })
-      .subscribe()
+    syncChannelSubscriptions()
+
+    // Reconnected after the socket dropped: something may have been missed.
+    let connectedBefore = false
+    stopConnected = onEchoConnected(() => {
+      if (connectedBefore) catchUp('reconnect')
+      connectedBefore = true
+    })
     window.addEventListener('focus', onFocus)
+    // Desktop app woke from sleep: give Wi-Fi a moment, then see what was missed.
+    stopResume = desktopBridge()?.onResume?.(() => { setTimeout(() => catchUp('wake'), 3000) }) ?? null
   }
 
   function stop() {
-    if (messageChannel) supabase.removeChannel(messageChannel)
-    messageChannel = null
-    if (mentionChannel) supabase.removeChannel(mentionChannel)
-    mentionChannel = null
+    const echo = currentEcho() // never open a new connection just to leave
+    if (started && echo) {
+      echo.leave('office')
+      echo.leave(`user.${started}`)
+      for (const id of subscribed) echo.leave(`channel.${id}`)
+    }
+    subscribed = new Set()
+    stopConnected?.()
+    stopConnected = null
     if (typeof window !== 'undefined') window.removeEventListener('focus', onFocus)
-    if (presenceChannel) supabase.removeChannel(presenceChannel)
-    if (profileChannel) supabase.removeChannel(profileChannel)
-    presenceChannel = profileChannel = null
+    stopResume?.()
+    stopResume = null
     started = null
     onlineIds.value = []
     unread.value = {}
@@ -266,39 +330,30 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   async function createClient(name: string) {
-    const { error } = await supabase.from('clients').insert({ name: name.trim() })
-    if (error) throw error
+    await api('/clients', { method: 'POST', body: { name: name.trim() } })
     await load()
   }
 
   async function createProject(clientId: string, name: string, isPrivate: boolean) {
-    const { data, error } = await supabase
-      .from('channels')
-      .insert({ kind: 'project', client_id: clientId, name: name.trim(), is_private: isPrivate })
-      .select('id')
-      .single()
-    if (error) throw error
+    const data = await api<ApiChannel>('/channels', { method: 'POST', body: { client_id: clientId, name: name.trim(), is_private: isPrivate } })
     await load()
     return data.id
   }
 
   async function setProjectArchived(channelId: string, archived: boolean) {
-    const { error } = await supabase.rpc('set_channel_archived', { chid: channelId, archived })
-    if (error) throw error
+    await api(`/channels/${channelId}/archived`, { method: 'PUT', body: { archived } })
     await load()
   }
 
   async function setClientArchived(clientId: string, archived: boolean) {
-    const { error } = await supabase.rpc('set_client_archived', { cid: clientId, archived })
-    if (error) throw error
+    await api(`/clients/${clientId}/archived`, { method: 'PUT', body: { archived } })
     await load()
   }
 
   async function startDm(userId: string) {
-    const { data, error } = await supabase.rpc('get_or_create_dm', { other_user: userId })
-    if (error) throw error
+    const data = await api<ApiChannel>('/dms', { method: 'POST', body: { user_id: userId } })
     await load()
-    return data
+    return data.id
   }
 
   function reset() {
@@ -312,5 +367,5 @@ export const useChatStore = defineStore('chat', () => {
     loaded.value = false
   }
 
-  return { clients, channels, directory, onlineIds, activePeople, displayStatus, start, stop, watchedChannelIds, setWatching, unread, mentions, totalUnread, totalMentions, activeChannelId, setActive, markRead, canManageClient, canManageChannel, loaded, myId, projectsByClient, dms, otherUser, channelTitle, userName, load, createClient, createProject, setProjectArchived, setClientArchived, archivedClients, archivedProjects, startDm, reset }
+  return { clients, channels, directory, onlineIds, activePeople, displayStatus, start, stop, watchedChannelIds, setWatching, unread, mentions, totalUnread, totalMentions, activeChannelId, setActive, markRead, canManageClient, canManageChannel, loaded, myId, projectsByClient, dms, otherUser, channelTitle, userName, load, createClient, createProject, setProjectArchived, setClientArchived, archivedClients, archivedProjects, startDm, reset, onChannelEvent }
 })

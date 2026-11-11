@@ -1,33 +1,24 @@
-import type { Database } from '~/types/database.types'
-
-const EXPIRES_IN = 6 * 60 * 60 // seconds
+// Signed URLs for private attachments, cached across the app and keyed by attachment id. The API signs them
+// for 6 hours; we refresh a little before that. Images open inline, other files download.
+const REFRESH_AFTER_MS = 5 * 60 * 60 * 1000
 
 interface FileRef {
-  path: string
-  mime_type: string | null
+  id: string
 }
 
-/** Signed URLs for private attachments, cached across the app. Images open inline, other files download. */
 export function useAttachmentUrls() {
-  const supabase = useSupabaseClient<Database>()
+  const api = useApi()
   const urls = useState<Record<string, string>>('attachment-urls', () => ({}))
+  const fetchedAt = useState<Record<string, number>>('attachment-urls-at', () => ({}))
 
   async function ensure(files: FileRef[]) {
-    const missing = files.filter((f) => !urls.value[f.path])
+    const now = Date.now()
+    const missing = files.filter((f) => !urls.value[f.id] || now - (fetchedAt.value[f.id] ?? 0) > REFRESH_AFTER_MS).map((f) => f.id)
     if (!missing.length) return
-    const inline = missing.filter((f) => isInlineImage(f.mime_type)).map((f) => f.path)
-    const download = missing.filter((f) => !isInlineImage(f.mime_type)).map((f) => f.path)
-    const results = await Promise.all([
-      inline.length ? supabase.storage.from('attachments').createSignedUrls(inline, EXPIRES_IN) : null,
-      download.length ? supabase.storage.from('attachments').createSignedUrls(download, EXPIRES_IN, { download: true }) : null,
-    ])
-    const next = { ...urls.value }
-    for (const res of results) {
-      for (const item of res?.data ?? []) {
-        if (item.path && item.signedUrl) next[item.path] = item.signedUrl
-      }
-    }
-    urls.value = next
+    const res = await api<{ urls: Record<string, string> | unknown[] }>('/attachments/urls', { method: 'POST', body: { ids: missing } })
+    const signed = Array.isArray(res.urls) ? {} : res.urls // PHP sends an empty object as []
+    urls.value = { ...urls.value, ...signed }
+    fetchedAt.value = { ...fetchedAt.value, ...Object.fromEntries(Object.keys(signed).map((id) => [id, now])) }
   }
 
   return { urls, ensure }

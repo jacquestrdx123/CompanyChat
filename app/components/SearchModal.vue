@@ -2,7 +2,7 @@
 import { tokensToDisplay } from '~/utils/mentions'
 
 const open = defineModel<boolean>('open', { required: true })
-const supabase = useSupabaseClient()
+const api = useApi()
 const chat = useChatStore()
 
 type Hit = { id: string; channel_id: string; user_id: string | null; body: string; created_at: string }
@@ -24,7 +24,13 @@ async function run() {
   }
   searching.value = true
   failed.value = ''
-  const { data, error } = await supabase.rpc('search_messages', { q, lim: 30 })
+  let data: Hit[] | null = null
+  let error: unknown = null
+  try {
+    data = await api<Hit[]>('/search', { query: { q, limit: 30 } })
+  } catch (e) {
+    error = e
+  }
   if (mine !== seq) return // a newer search superseded this one
   searching.value = false
   if (error) {

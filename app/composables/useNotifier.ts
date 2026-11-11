@@ -87,6 +87,7 @@ export function useNotifier() {
     try {
       const n = new Notification(opts.title, options)
       n.onclick = () => {
+        desktopBridge()?.showWindow?.() // the desktop app's window may be hidden in the tray
         window.focus()
         navigateTo(url)
         n.close()

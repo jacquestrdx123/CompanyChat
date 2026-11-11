@@ -1,4 +1,5 @@
 import { defineStore } from 'pinia'
+import type { ApiUser, AppRole } from '~/types/api'
 import type { UserStatus } from '~/utils/status'
 
 export interface Profile {
@@ -6,13 +7,13 @@ export interface Profile {
   email: string
   display_name: string
   avatar_url: string | null
-  app_role: 'super_admin' | 'admin' | 'member' | 'viewer'
+  app_role: AppRole
   status: UserStatus
 }
 
 export const useProfileStore = defineStore('profile', () => {
-  const supabase = useSupabaseClient()
-  const user = useSupabaseUser()
+  const api = useApi()
+  const auth = useAuth()
   const profile = ref<Profile | null>(null)
 
   const isSuperAdmin = computed(() => profile.value?.app_role === 'super_admin')
@@ -21,24 +22,24 @@ export const useProfileStore = defineStore('profile', () => {
   const isViewer = computed(() => profile.value?.app_role === 'viewer')
 
   async function load() {
-    const id = user.value?.id ?? user.value?.sub
-    if (!id) {
+    if (!auth.signedIn.value) {
       profile.value = null
       return
     }
-    const { data, error } = await supabase.from('profiles').select('*').eq('id', id).single()
-    if (error) throw error
-    profile.value = data as Profile
+    const me = await api<ApiUser>('/me')
+    auth.user.value = me
+    profile.value = { ...me, email: me.email ?? '' }
   }
 
   async function setStatus(status: UserStatus) {
     if (!profile.value) return
     const previous = profile.value.status
     profile.value.status = status
-    const { error } = await supabase.from('profiles').update({ status }).eq('id', profile.value.id)
-    if (error) {
+    try {
+      await api('/me', { method: 'PATCH', body: { status } })
+    } catch (e) {
       profile.value.status = previous
-      throw error
+      throw e
     }
   }
 

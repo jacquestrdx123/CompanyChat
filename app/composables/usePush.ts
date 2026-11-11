@@ -1,6 +1,6 @@
 // Background (Web Push) notifications for this browser/device: they arrive even when CompanyChat is closed
 // (as long as the browser runs). The on/off switch is per device (localStorage); the subscription itself is
-// saved in push_subscriptions so the send-push Edge Function can reach it.
+// saved by the API (POST /api/push-subscriptions) so the server's push job can reach it.
 const STORAGE_KEY = 'companychat:push'
 
 function load(): boolean {
@@ -20,7 +20,7 @@ function toKey(base64: string): Uint8Array<ArrayBuffer> {
 }
 
 export function usePush() {
-  const supabase = useSupabaseClient()
+  const api = useApi()
   const notifier = useNotifier()
   const vapidKey = String(useRuntimeConfig().public.vapidPublicKey ?? '')
   const enabled = useState<boolean>('push-enabled', load)
@@ -49,14 +49,15 @@ export function usePush() {
 
   async function save(sub: PushSubscription) {
     const json = sub.toJSON()
-    const { error } = await supabase.rpc('save_push_subscription', {
-      p_endpoint: sub.endpoint,
-      p_p256dh: json.keys?.p256dh ?? '',
-      p_auth: json.keys?.auth ?? '',
-      p_preview: notifier.prefs.value.preview,
-      p_user_agent: navigator.userAgent,
+    await api('/push-subscriptions', {
+      method: 'POST',
+      body: {
+        endpoint: sub.endpoint,
+        keys: { p256dh: json.keys?.p256dh ?? '', auth: json.keys?.auth ?? '' },
+        show_preview: notifier.prefs.value.preview,
+        user_agent: navigator.userAgent,
+      },
     })
-    if (error) throw error
   }
 
   async function enable() {
@@ -72,7 +73,7 @@ export function usePush() {
   async function disable() {
     const sub = await currentSubscription(false).catch(() => null)
     if (sub) {
-      await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint)
+      await api('/push-subscriptions', { method: 'DELETE', body: { endpoint: sub.endpoint } }).catch(() => {})
       await sub.unsubscribe().catch(() => false)
     }
     remember(false)
@@ -92,13 +93,13 @@ export function usePush() {
   /** On sign-out: stop pushing to this browser for that account (the device switch stays on). */
   async function forget() {
     const sub = await currentSubscription(false).catch(() => null)
-    if (sub) await supabase.from('push_subscriptions').delete().eq('endpoint', sub.endpoint)
+    if (sub) await api('/push-subscriptions', { method: 'DELETE', body: { endpoint: sub.endpoint } })
   }
 
   async function syncPreview() {
     if (!active.value) return
     const sub = await currentSubscription(false).catch(() => null)
-    if (sub) await supabase.from('push_subscriptions').update({ show_preview: notifier.prefs.value.preview }).eq('endpoint', sub.endpoint)
+    if (sub) await api('/push-subscriptions', { method: 'PATCH', body: { endpoint: sub.endpoint, show_preview: notifier.prefs.value.preview } })
   }
 
   return { supported, enabled, active, enable, disable, sync, forget, syncPreview }
